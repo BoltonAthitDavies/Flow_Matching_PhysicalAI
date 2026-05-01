@@ -1,5 +1,4 @@
 #!/usr/bin/python3
-# turtle_controller_3D_1model.py
 
 """
 turtle_controller.py
@@ -29,14 +28,14 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist, Point
 from turtlesim.msg import Pose
 
-CHECKPOINT_PATH = "src/trajectory_publisher/scripts/logs/pose_trajectory_3D/cfm/H64_T100/20260430-1155/state_192000.pt"
+# CHECKPOINT_PATH = "src/trajectory_publisher/scripts/logs/pose_trajectory_athit_notrajpart/cfm/H64_T100/20260416-1405/state_192000.pt"
+CHECKPOINT_PATH = "src/trajectory_publisher/scripts/logs/pose_trajectory_pnut/cfm/H64_T100/20260424-1440/state_192000.pt"
 TURTLESIM_ORIGIN_X = 5.544   # TurtleSim default spawn x
 TURTLESIM_ORIGIN_Y = 5.544   # TurtleSim default spawn y
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 HORIZON = 64        # padded horizon (must match training)
 ORIGINAL_LEN = 50   # original trajectory length
 N_SAMPLING_STEPS = 10    # Euler sampling steps for CFM (flow matching needs far fewer than diffusion)
-CFM_DT           = 0.04  # seconds per waypoint (25 Hz playback)
 
 # ── PID helper ──────────────────────────────────────────────────────────────
 class PIDController:
@@ -89,12 +88,15 @@ class TurtleController(Node):
 
         # ── trapezoid parameters ─────────────────────────────────────────
         self.declare_parameter('v_max',    2.0)   # m/s
+        # self.declare_parameter('v_max',   0.156)   # m/s
         self.declare_parameter('a_max',    0.5)   # m/s²
+        # self.declare_parameter('a_max',   0.028)   # m/s²
         self.declare_parameter('distance', 5.0)   # m
 
         # ── PID parameters ───────────────────────────────────────────────
         self.declare_parameter('goal_tolerance',  0.05)   # m
-        self.declare_parameter('v_max_pid',       0.156)  # m/s  linear clamp
+        # self.declare_parameter('v_max_pid',       2.0)    # m/s  linear clamp
+        self.declare_parameter('v_max_pid',       0.156)    # m/s  linear clamp
         self.declare_parameter('w_max_pid',       3.0)    # rad/s angular clamp
         self.declare_parameter('kp_linear',       1.5)
         self.declare_parameter('ki_linear',       0.0)
@@ -102,8 +104,8 @@ class TurtleController(Node):
         self.declare_parameter('kp_angular',      5.0)
         self.declare_parameter('ki_angular',      0.0)
         self.declare_parameter('kd_angular',      0.1)
-        self.declare_parameter('angle_tolerance',    0.05)   # rad
-        self.declare_parameter('waypoint_tolerance', 0.15)   # m
+        self.declare_parameter('angle_tolerance',    0.05)   # rad — rotation done threshold
+        self.declare_parameter('waypoint_tolerance', 0.15)  # m   — advance to next waypoint
 
         # ── read common params ────────────────────────────────────────────
         self.mode        = self.get_parameter('mode').value
@@ -186,7 +188,7 @@ class TurtleController(Node):
 
     # ── PID init ──────────────────────────────────────────────────────────
     def _init_pid(self):
-        self.goal_x: float | None = None
+        self.goal_x: float | None = None   # set by /goal_position topic
         self.goal_y: float | None = None
         self.goal_tolerance = float(self.get_parameter('goal_tolerance').value)
         v_lim = float(self.get_parameter('v_max_pid').value)
@@ -207,16 +209,16 @@ class TurtleController(Node):
 
         self.angle_tolerance    = float(self.get_parameter('angle_tolerance').value)
         self.waypoint_tolerance = float(self.get_parameter('waypoint_tolerance').value)
+        self._rotating = False   # True while doing rotate-first phase
 
-        # ── CFM 3D model (loaded once at startup) ────────────────────────
-        self.get_logger().info('[PID] Loading CFM 3D model …')
+        # ── CFM model (loaded once at startup) ───────────────────────────
+        self.get_logger().info('[PID] Loading CFM model …')
         self.diffusion = self.model_init()
         self.get_logger().info('[PID] CFM model ready.')
 
-        # ── trajectory state (50 waypoints of x, y, theta) ───────────────
-        self._traj_waypoints  = None   # np.ndarray (50, 3)
-        self._traj_idx        = 0
-        self._traj_step_timer = 0.0
+        # ── trajectory state ─────────────────────────────────────────────
+        self._traj_waypoints = None   # np.ndarray (50, 2) after sampling
+        self._traj_idx       = 0      # index of current waypoint
 
         self._current_pose: Pose | None = None
         self.create_subscription(
@@ -250,21 +252,58 @@ class TurtleController(Node):
         self.goal_y = msg.y
         self.pid_linear.reset()
         self.pid_angular.reset()
+        self._rotating = True   # rotate first before translating
         self._phase = self._ACTIVE
 
-        self._resample_trajectory(self._current_pose, label='initial')
+        # ── sample CFM trajectory (runs once per goal) ───────────────────
+        pose = self._current_pose
+        if pose is not None:
+            qdot_x = pose.linear_velocity * math.cos(pose.theta)
+            qdot_y = pose.linear_velocity * math.sin(pose.theta)
+            q_x, q_y = pose.x, pose.y
+        else:
+            qdot_x = qdot_y = 0.0
+            q_x = q_y = 0.0
+
+        # Convert TurtleSim absolute coords → model coords (centered at spawn)
+        goal_x_m = msg.x - TURTLESIM_ORIGIN_X
+        goal_y_m = msg.y - TURTLESIM_ORIGIN_Y
+        q_x_m    = q_x   - TURTLESIM_ORIGIN_X
+        q_y_m    = q_y   - TURTLESIM_ORIGIN_Y
+
+        # Context order (N, 8): [s_goal_x, s_goal_y, qdot_x, qdot_y, v_const, accel, q_x, q_y]
+        context_data = np.array(
+            [[goal_x_m, goal_y_m, qdot_x, qdot_y, 0.156, 0.028, q_x_m, q_y_m]],
+            dtype=np.float32
+        )
+        context = torch.tensor(context_data, dtype=torch.float32)
+        _t0 = self.get_clock().now()
+        samples, _ = self.sample_trajectories(self.diffusion, context)
+        _dt_ms = (self.get_clock().now() - _t0).nanoseconds / 1e6
+        self.get_logger().info(f'[CFM] Trajectory generated in {_dt_ms:.1f} ms')
+
+        # Convert sampled waypoints back to TurtleSim absolute coords
+        waypoints = samples[0]   # (50, 2)
+        waypoints[:, 0] += TURTLESIM_ORIGIN_X
+        waypoints[:, 1] += TURTLESIM_ORIGIN_Y
+        self._traj_waypoints = waypoints
+        self._traj_idx       = 0
 
         self.get_logger().info(
-            f'[PID] New goal: ({self.goal_x:.3f}, {self.goal_y:.3f}) — CFM 3D trajectory sampled'
+            f'[PID] New goal: ({self.goal_x:.3f}, {self.goal_y:.3f}) m — '
+            f'CFM trajectory sampled ({ORIGINAL_LEN} waypoints) — rotating first'
         )
 
     # ── timer callback ────────────────────────────────────────────────────
     def _timer_cb(self):
+        # --- wait before starting ---
         if self._phase == self._WAITING:
             self._wait += self.dt
             if self._wait >= self.start_delay:
                 self._phase = self._ACCEL if self.mode == 'trapezoid' else self._ACTIVE
-                self.get_logger().info(f'[{self.mode.upper()}] Control started.')
+                self.get_logger().info(
+                    f'[{self.mode.upper()}] Control started.'
+                )
             return
 
         if self._phase == self._DONE:
@@ -296,60 +335,21 @@ class TurtleController(Node):
 
         self._t += self.dt
 
-    # ── trajectory helper ─────────────────────────────────────────────────
-    def _resample_trajectory(self, pose, label: str = 'sample'):
-        if pose is not None:
-            qdot_x     = pose.linear_velocity * math.cos(pose.theta)
-            qdot_y     = pose.linear_velocity * math.sin(pose.theta)
-            q_x_m      = pose.x - TURTLESIM_ORIGIN_X
-            q_y_m      = pose.y - TURTLESIM_ORIGIN_Y
-            q_theta    = pose.theta
-            qdot_theta = pose.angular_velocity
-        else:
-            qdot_x = qdot_y = 0.0
-            q_x_m = q_y_m = 0.0
-            q_theta = qdot_theta = 0.0
-
-        goal_x_m     = self.goal_x - TURTLESIM_ORIGIN_X
-        goal_y_m     = self.goal_y - TURTLESIM_ORIGIN_Y
-        s_goal_theta = math.atan2(goal_y_m - q_y_m, goal_x_m - q_x_m)
-
-        # Context: [s_goal_x, s_goal_y, s_goal_theta, v_const, accel,
-        #           q_init_x, q_init_y, q_init_theta, qdot_init_x, qdot_init_y, qdot_init_theta]
-        context_data = np.array(
-            [[goal_x_m, goal_y_m, s_goal_theta, 0.156, 0.028,
-              q_x_m, q_y_m, q_theta, qdot_x, qdot_y, qdot_theta]],
-            dtype=np.float32
-        )
-        context = torch.tensor(context_data, dtype=torch.float32)
-        _t0 = self.get_clock().now()
-        samples, _ = self.sample_trajectories(self.diffusion, context)
-        _dt_ms = (self.get_clock().now() - _t0).nanoseconds / 1e6
-        self.get_logger().info(f'[CFM-3D] Trajectory {label} in {_dt_ms:.1f} ms')
-
-        waypoints = samples[0]          # (50, 3): x, y, theta
-        waypoints[:, 0] += TURTLESIM_ORIGIN_X
-        waypoints[:, 1] += TURTLESIM_ORIGIN_Y
-        # theta (col 2) is absolute heading — no offset needed
-        self._traj_waypoints  = waypoints
-        self._traj_idx        = 0
-        self._traj_step_timer = 0.0
-
-    # ── model ─────────────────────────────────────────────────────────────
+    # ── PID step ──────────────────────────────────────────────────────────
     def model_init(self):
         import sys, os
-        scripts_dir = os.path.dirname(os.path.abspath(__file__))
+        scripts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)))
         if scripts_dir not in sys.path:
             sys.path.insert(0, scripts_dir)
 
         from diffuser.models.temporal_film import ConditionalUnet1D
         from diffuser.models.cfm import CFM
 
-        observation_dim = 3   # x, y, theta
-        action_dim      = 0
-        context_dim     = 11  # [s_goal_x, s_goal_y, s_goal_theta, v_const, accel,
-                               #  q_init_x, q_init_y, q_init_theta, qdot_init_x, qdot_init_y, qdot_init_theta]
+        observation_dim = 2
+        action_dim = 0
+        context_dim = 8
 
+        # Build model (must match training config)
         model = ConditionalUnet1D(
             horizon=HORIZON,
             transition_dim=observation_dim + action_dim,
@@ -360,6 +360,7 @@ class TurtleController(Node):
             dim_mults=(1, 4, 8),
         ).to(DEVICE)
 
+        # Build diffusion wrapper
         diffusion = CFM(
             model=model,
             horizon=HORIZON,
@@ -370,32 +371,60 @@ class TurtleController(Node):
             predict_epsilon=False,
         ).to(DEVICE)
 
+        # Load checkpoint — remap keys if saved with NeuralODE wrapper (node.vf.vf.* → model.*)
         checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
-        diffusion.load_state_dict(checkpoint['model'])
+        raw_sd = checkpoint['model']
+        if any(k.startswith('node.vf.vf.') for k in raw_sd):
+            raw_sd = {k.replace('node.vf.vf.', 'model.', 1): v
+                      for k, v in raw_sd.items()
+                      if k.startswith('node.vf.vf.')}
+        diffusion.load_state_dict(raw_sd)
+        
         return diffusion
-
+    
     @torch.no_grad()
     def sample_trajectories(self, diffusion, contexts, n_samples_per=1):
+        """
+        Generate trajectories for given context vectors.
+        
+        Args:
+            diffusion: trained CFM model
+            contexts: (B, 9) context tensor
+            n_samples_per: how many samples to generate per context
+        Returns:
+            samples: (B * n_samples_per, ORIGINAL_LEN, 2) numpy array
+            contexts_repeated: (B * n_samples_per, 9) numpy array
+        """
+        
         diffusion.eval()
-        ctx        = contexts.repeat_interleave(n_samples_per, dim=0).to(DEVICE)
+        
+        # repeat contexts for multiple samples
+        ctx = contexts.repeat_interleave(n_samples_per, dim=0).to(DEVICE)
         batch_size = ctx.shape[0]
+        
         global_cond = {'hideouts': ctx}
-        cond        = [(np.array([]), np.array([]))] * batch_size
-        samples     = diffusion.conditional_sample(global_cond, cond)  # (B, HORIZON, 3)
-        samples     = samples.cpu().numpy()[:, :ORIGINAL_LEN, :]        # (B, 50, 3)
-        return samples, ctx.cpu().numpy()
-
-    # ── PID step ──────────────────────────────────────────────────────────
+        cond = [(np.array([]), np.array([]))] * batch_size
+        
+        samples = diffusion.conditional_sample(global_cond, cond)  # (B*n, HORIZON, 2)
+        samples = samples.cpu().numpy()
+        
+        # trim padding back to original 50 steps
+        samples = samples[:, :ORIGINAL_LEN, :]
+        contexts_out = ctx.cpu().numpy()
+        
+        return samples, contexts_out
+    
+    
     def _step_pid(self):
         if self._current_pose is None or self.goal_x is None or self.goal_y is None:
             return
 
         pose = self._current_pose
 
-        # --- goal reached ---
-        dx_goal      = self.goal_x - pose.x
-        dy_goal      = self.goal_y - pose.y
-        dist_to_goal = math.sqrt(dx_goal ** 2 + dy_goal ** 2)
+        # --- goal reached (always checked against the final goal) ---
+        dx_goal = self.goal_x - pose.x
+        dy_goal = self.goal_y - pose.y
+        dist_to_goal = math.sqrt(dx_goal * dx_goal + dy_goal * dy_goal)
 
         if dist_to_goal < self.goal_tolerance:
             self._publish(0.0, 0.0)
@@ -406,35 +435,51 @@ class TurtleController(Node):
             )
             return
 
-        # --- CFM 3D trajectory: x/y/theta played simultaneously at 25 Hz ---
-        if self._traj_waypoints is not None:
-            self._traj_step_timer += self.dt
-            if self._traj_step_timer >= CFM_DT:
-                self._traj_step_timer = 0.0
+        # --- rotate-first phase: align toward final goal (CFM is translation-only) ---
+        if self._rotating:
+            angle_to_goal = math.atan2(dy_goal, dx_goal)
+            angle_error   = angle_to_goal - pose.theta
+            angle_error   = (angle_error + math.pi) % (2 * math.pi) - math.pi
+            w = self.pid_angular.compute(angle_error, self.dt)
+            self._publish(0.0, w)
+            if abs(angle_error) < self.angle_tolerance:
+                self._rotating = False
+                self.pid_linear.reset()
+                self.pid_angular.reset()
+                self.get_logger().info('[PID] Rotation done — starting CFM trajectory tracking')
+            return
+
+        # --- translation: follow CFM waypoints toward final goal ---
+        if self._traj_waypoints is not None and self._traj_idx < ORIGINAL_LEN:
+            wp_x = self._traj_waypoints[self._traj_idx, 0]
+            wp_y = self._traj_waypoints[self._traj_idx, 1]
+            wp_dist = math.sqrt((wp_x - pose.x) ** 2 + (wp_y - pose.y) ** 2)
+            if wp_dist < self.waypoint_tolerance:
                 self._traj_idx += 1
                 self.get_logger().debug(f'[PID] Waypoint {self._traj_idx}/{ORIGINAL_LEN}')
-                if self._traj_idx >= ORIGINAL_LEN:
-                    self._resample_trajectory(pose, label='re-sample')
-
-            target_x     = self._traj_waypoints[self._traj_idx, 0]
-            target_y     = self._traj_waypoints[self._traj_idx, 1]
-            target_theta = self._traj_waypoints[self._traj_idx, 2]
+                if self._traj_idx < ORIGINAL_LEN:
+                    wp_x = self._traj_waypoints[self._traj_idx, 0]
+                    wp_y = self._traj_waypoints[self._traj_idx, 1]
+                else:
+                    wp_x, wp_y = self.goal_x, self.goal_y
+            target_x, target_y = wp_x, wp_y
         else:
             target_x, target_y = self.goal_x, self.goal_y
-            target_theta = math.atan2(dy_goal, dx_goal)
 
-        # Linear: PID on distance to target position
-        dx   = target_x - pose.x
-        dy   = target_y - pose.y
-        dist = math.sqrt(dx ** 2 + dy ** 2)
-        v    = self.pid_linear.compute(dist, self.dt)
+        dx = target_x - pose.x
+        dy = target_y - pose.y
+        dist = math.sqrt(dx * dx + dy * dy)
 
-        # Angular: track CFM theta reference directly
-        angle_error = target_theta - pose.theta
-        angle_error = (angle_error + math.pi) % (2 * math.pi) - math.pi
+        # --- compute heading error toward current waypoint ---
+        angle_to_target = math.atan2(dy, dx)
+        angle_error     = angle_to_target - pose.theta
+        angle_error     = (angle_error + math.pi) % (2 * math.pi) - math.pi
+
+        # --- PID outputs ---
+        v = self.pid_linear.compute(dist, self.dt)
         w = self.pid_angular.compute(angle_error, self.dt)
 
-        # Scale linear speed when heading is far off
+        # Scale down linear speed when heading is far off
         heading_factor = max(0.0, math.cos(angle_error))
         v *= heading_factor
 
