@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-# turtle_controller_3D_1model_v2.py
+# turtle_controller_3D_1model_v1.py
 
 """
 turtle_controller.py
@@ -318,7 +318,7 @@ class TurtleController(Node):
         # Context: [s_goal_x, s_goal_y, s_goal_theta, v_const, accel,
         #           q_init_x, q_init_y, q_init_theta, qdot_init_x, qdot_init_y, qdot_init_theta]
         context_data = np.array(
-            [[goal_x_m, goal_y_m, s_goal_theta, 0.156, 0.028, 0.5, 0.05,
+            [[goal_x_m, goal_y_m, s_goal_theta, 0.156, 0.028,
               q_x_m, q_y_m, q_theta, qdot_x, qdot_y, qdot_theta]],
             dtype=np.float32
         )
@@ -348,7 +348,7 @@ class TurtleController(Node):
 
         observation_dim = 3   # x, y, theta
         action_dim      = 0
-        context_dim     = 13  # [s_goal_x, s_goal_y, s_goal_theta, v_const, accel, omega_const, alpha_const,
+        context_dim     = 11  # [s_goal_x, s_goal_y, s_goal_theta, v_const, accel,
                                #  q_init_x, q_init_y, q_init_theta, qdot_init_x, qdot_init_y, qdot_init_theta]
 
         model = ConditionalUnet1D(
