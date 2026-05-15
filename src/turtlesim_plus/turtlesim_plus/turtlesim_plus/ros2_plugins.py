@@ -208,7 +208,7 @@ class TurtlesimPlusNode(Node):
         
     def spawn_turtle_srv_callback(self,request:Spawn.Request,response:Spawn.Response):
         flag = False
-        init_pose = [7.5,7.5,0.0]
+        init_pose = [0.0,0.0,0.0]
         if not request.name:
             name = 'turtle1'
             flag = True

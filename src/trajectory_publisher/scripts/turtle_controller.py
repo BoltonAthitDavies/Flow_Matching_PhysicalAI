@@ -31,8 +31,10 @@ from turtlesim.msg import Pose
 
 # CHECKPOINT_PATH = "src/trajectory_publisher/scripts/logs/pose_trajectory_3D/cfm/H64_T100/20260430-1155/state_192000.pt"
 CHECKPOINT_PATH = "src/trajectory_publisher/scripts/logs/pose_trajectory_3D_multiinit/cfm/H64_T100/20260512-1337/state_192000.pt"
-TURTLESIM_ORIGIN_X = 5.544   # TurtleSim default spawn x
-TURTLESIM_ORIGIN_Y = 5.544   # TurtleSim default spawn y
+# TURTLESIM_ORIGIN_X = 5.544   # TurtleSim default spawn x
+# TURTLESIM_ORIGIN_Y = 5.544   # TurtleSim default spawn y
+TURTLESIM_ORIGIN_X = 0.0   # TurtleSim default spawn x
+TURTLESIM_ORIGIN_Y = 0.0   # TurtleSim default spawn y
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 HORIZON = 64        # padded horizon (must match training)
 ORIGINAL_LEN = 50   # original trajectory length
@@ -94,7 +96,7 @@ class TurtleController(Node):
         self.declare_parameter('distance', 5.0)   # m
 
         # ── PID parameters ───────────────────────────────────────────────
-        self.declare_parameter('goal_tolerance',  0.05)   # m
+        self.declare_parameter('goal_tolerance',  0.1)   # m
         self.declare_parameter('v_max_pid',       0.156)  # m/s  linear clamp
         self.declare_parameter('w_max_pid',       3.0)    # rad/s angular clamp
         self.declare_parameter('kp_linear',       1.5)
