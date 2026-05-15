@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-# turtle_controller_3D_1model_multiinit.py
+# turtle_controller_3D_1model_v2.py
 
 """
 turtle_controller.py
@@ -30,7 +30,7 @@ from geometry_msgs.msg import Twist, Point
 from turtlesim.msg import Pose
 
 # CHECKPOINT_PATH = "src/trajectory_publisher/scripts/logs/pose_trajectory_3D/cfm/H64_T100/20260430-1155/state_192000.pt"
-CHECKPOINT_PATH = "src/trajectory_publisher/scripts/logs/pose_trajectory_3D_multiinit/cfm/H64_T100/20260512-1337/state_192000.pt"
+CHECKPOINT_PATH = "src/trajectory_publisher/scripts/logs/pose_trajectory_3DV2/cfm/H64_T100/20260505-1157/state_192000.pt"
 TURTLESIM_ORIGIN_X = 5.544   # TurtleSim default spawn x
 TURTLESIM_ORIGIN_Y = 5.544   # TurtleSim default spawn y
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
